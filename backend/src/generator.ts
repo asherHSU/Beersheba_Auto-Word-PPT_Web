@@ -29,8 +29,27 @@ export interface SongData {
 }
 
 // 🚀 第一部分：Node.js 快速檔案掃描 (解決缺檔顯示問題)
+// 外部同步（雲端→NAS）新增檔案後，需讓快取過期才會更新「有無 PPT」狀態；上傳 API 仍會手動 clear。
 
 let fileCache: { name: string; path: string; normalized: string }[] | null = null;
+let fileCacheRoot: string | null = null;
+let fileCacheBuiltAt = 0;
+
+/** 毫秒。-1 = 不自動過期（與舊版相同，僅 upload / clearFileCache 會刷新）。預設 5 分鐘。 */
+function getPptLibraryCacheTtlMs(): number {
+    const raw = process.env.PPT_LIBRARY_CACHE_TTL_MS;
+    if (raw === undefined || raw === '') return 300_000;
+    const n = parseInt(raw, 10);
+    if (Number.isNaN(n)) return 300_000;
+    return n;
+}
+
+function shouldRebuildFileCache(rootPath: string): boolean {
+    if (!fileCache || fileCacheRoot !== rootPath) return true;
+    const ttl = getPptLibraryCacheTtlMs();
+    if (ttl < 0) return false;
+    return Date.now() - fileCacheBuiltAt > ttl;
+}
 
 // 輔助：正規化字串 (去除非英數中文並轉小寫)
 function normalizeString(str: string): string {
@@ -75,16 +94,23 @@ function buildFileCache(rootPath: string) {
     
     traverse(rootPath);
     fileCache = files;
+    fileCacheRoot = rootPath;
+    fileCacheBuiltAt = Date.now();
     generatorLogger.info(`✅ Cache built. Found ${files.length} presentation files in ${rootPath}`);
 }
 
 export function clearFileCache() {
     fileCache = null;
+    fileCacheRoot = null;
+    fileCacheBuiltAt = 0;
     generatorLogger.info('🔄 File cache cleared.');
 }
 
 // 尋找 PPT 路徑
 export async function findPptPath(rootPath: string, song: SongInput): Promise<string | null> {
+    if (shouldRebuildFileCache(rootPath)) {
+        fileCache = null;
+    }
     if (!fileCache) {
         buildFileCache(rootPath);
     }
@@ -116,7 +142,10 @@ export async function findPptPath(rootPath: string, song: SongInput): Promise<st
 async function runPythonScript(mode: 'preview' | 'generate', payload: any, outputDir?: string): Promise<any> {
     // 🛠️ 修正：使用 process.cwd() 確保指向 /app (Docker) 或 專案根目錄 (Local)
     const PROJECT_ROOT = process.cwd(); 
-    const RESOURCES_DIR = path.join(PROJECT_ROOT, 'resources');
+    // Detect resources path (Local dev: ../resources, Docker/Prod: ./resources)
+    const RESOURCES_DIR = fs.existsSync(path.join(PROJECT_ROOT, "../resources")) 
+        ? path.join(PROJECT_ROOT, "../resources") 
+        : path.join(PROJECT_ROOT, "resources");
     // 注意：腳本位置相對於 __dirname (dist/src) 
     const SCRIPT_PATH = path.join(__dirname, '../scripts/generator.py');
 
@@ -191,7 +220,10 @@ export async function extractSongData(songs: SongInput[] | any[], pptLibraryPath
 export async function generateFiles(input: SongInput[] | SongData[]): Promise<string> {
     // 🛠️ 修正：使用 process.cwd() 確保路徑正確
     const PROJECT_ROOT = process.cwd();
-    const OUTPUT_DIR = path.join(PROJECT_ROOT, 'output');
+    // Detect output path (Local dev: ../output, Docker/Prod: ./output)
+    const OUTPUT_DIR = fs.existsSync(path.join(PROJECT_ROOT, "../resources")) 
+        ? path.join(PROJECT_ROOT, "../output") 
+        : path.join(PROJECT_ROOT, "output");
     
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 

@@ -23,11 +23,14 @@ services:
       - mongo
     environment:
       - MONGO_URI=mongodb://mongo:27017
-      # 請確保這裡的 SECRET 和前端一致，生產環境請修改
-      - JWT_SECRET=change_this_to_a_secure_secret_key
+      # 可在專案根目錄 .env 設定 JWT_SECRET、PPT_LIBRARY_CACHE_TTL_MS
+      - JWT_SECRET=${JWT_SECRET:-change_this_to_a_secure_secret_key}
+      - PPT_LIBRARY_CACHE_TTL_MS=${PPT_LIBRARY_CACHE_TTL_MS:-300000}
     volumes:
       # ✅ 掛載資源資料夾，確保生成的檔案能同步回本機
       - ./resources:/app/resources
+      # 可選：覆寫 ppt_library。在 NAS 設 PPT_LIBRARY_HOST_PATH 指向雲端同步資料夾（見 .env.example）
+      - ${PPT_LIBRARY_HOST_PATH:-./resources/ppt_library}:/app/resources/ppt_library
       - ./output:/app/output
     networks:
       - church-net
@@ -46,6 +49,19 @@ services:
       - backend
     networks:
       - church-net
+
+  # 4.（選用）Cloudflare Tunnel：無固定 IP 時對外開站。需先在 Cloudflare 建立 Tunnel 並取得 TOKEN。
+  # 啟動：docker compose --profile tunnel up -d
+  # Zero Trust 裡「Public Hostname」的服務網址請設為 http://localhost:80（與 frontend 共用網路命名空間）
+  cloudflared:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:latest
+    container_name: church_cloudflared
+    restart: unless-stopped
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    network_mode: "service:frontend"
+    depends_on:
+      - frontend
 
 volumes:
   mongo_data:
