@@ -102,7 +102,7 @@ def calculate_optimal_font_size(lines):
     Returns:
         int: 計算出的最佳字體大小 (points)
     """
-    if not lines: return 48 # 預設大字體
+    if not lines: return 32 # 預設大字體
     
     # 1. 計算最長那行的「視覺寬度」
     max_visual_width = 0
@@ -118,29 +118,25 @@ def calculate_optimal_font_size(lines):
             max_visual_width = current_width
 
     # 2. 定義畫布限制 (Points)
-    # PPT 寬度 10吋，左右邊界各 0.5吋 -> 可用寬度 9吋 = 648 pt
+    # PPT 寬度 10吋，左右邊界各 0.25吋 -> 可用寬度 9.5吋 = 684 pt
     # PPT 高度 5.625吋，扣掉標題與邊界 -> 可用高度約 3.5吋 = 252 pt
     
-    SAFE_WIDTH_PTS = 610  # 保險起見稍微縮小
+    SAFE_WIDTH_PTS = 648  # 9吋 (9.5吋可用，但保留一些邊界)
     SAFE_HEIGHT_PTS = 230 # 用於歌詞的垂直空間
     
     # 3. 根據「寬度」計算上限
-    # 假設字體大小為 S，全形字寬度約為 S
-    # S * max_visual_width <= SAFE_WIDTH_PTS
     if max_visual_width < 1: max_visual_width = 1
     size_limit_by_width = int(SAFE_WIDTH_PTS / max_visual_width)
     
     # 4. 根據「高度」計算上限
-    # 假設行高倍率為 1.15
-    # total_lines * S * 1.15 <= SAFE_HEIGHT_PTS
     line_count = len(lines)
     if line_count < 1: line_count = 1
     size_limit_by_height = int(SAFE_HEIGHT_PTS / (line_count * 1.15))
     
-    # 5. 取兩者最小值，並設定合理的上下限
-    final_size = min(size_limit_by_width, size_limit_by_height, 54) # 最大不超過 54
+    # 5. 取兩者最小值，並設定合理的上下限 (使用者要求上限 32)
+    final_size = min(size_limit_by_width, size_limit_by_height, 32)
     
-    if final_size < 24: final_size = 24 # 最小不低於 24 (再小就看不到了，讓它自動換行)
+    if final_size < 24: final_size = 24 # 最小不低於 24
     
     return final_size
 
@@ -227,7 +223,7 @@ elif MODE == "generate":
         
         lyrics_data = []
         if is_from_preview:
-            lyrics_data = [re.sub(r'[ \t]+', ' ', line) for line in song['lyrics']]
+            lyrics_data = [re.sub(r'[ \t]+', ' ', line) for line in song['lyrics'] if line.strip()]
         else:
             sid = song.get('id', 0)
             path_found = find_ppt_path(PPT_LIBRARY_PATH, sid, title)
@@ -272,8 +268,8 @@ elif MODE == "generate":
             # ✨✨✨ 使用新的智慧字體計算 ✨✨✨
             font_size = calculate_optimal_font_size(slide_lines)
 
-            # 歌詞文字方塊
-            tb_lyrics = slide.shapes.add_textbox(Inches(0.5), Inches(0.1), Inches(9), Inches(3.5))
+            # 歌詞文字方塊 (更寬)
+            tb_lyrics = slide.shapes.add_textbox(Inches(0.25), Inches(0.1), Inches(9.5), Inches(3.5))
             tf_lyrics = tb_lyrics.text_frame
             tf_lyrics.word_wrap = True # 允許自動換行 (作為最後防線)
             
@@ -282,8 +278,8 @@ elif MODE == "generate":
             p_lyrics.alignment = PP_ALIGN.CENTER
             apply_font_settings(p_lyrics, FONT_NAME, font_size, YELLOW_TEXT, True)
 
-            # Footer
-            tb_title = slide.shapes.add_textbox(Inches(0.5), Inches(5.0), Inches(9), Inches(0.5))
+            # Footer (更寬)
+            tb_title = slide.shapes.add_textbox(Inches(0.25), Inches(5.0), Inches(9.5), Inches(0.5))
             tf_title = tb_title.text_frame
             p_title = tf_title.paragraphs[0]
             p_title.text = f"《{title}》"

@@ -110,7 +110,9 @@ const FileGenerator: React.FC<{ token: string | null }> = () => {
 
   const handleLyricsChange = (index: number, newText: string) => {
     const updated = [...previewData];
-    updated[index].lyrics = newText.split('\n');
+    // 先按行分割，再過濾掉換頁標記，避免正則表達式處理不當導致的問題
+    const cleanLyrics = newText.split('\n').filter(line => line !== PAGE_BREAK_MARKER);
+    updated[index].lyrics = cleanLyrics;
     setPreviewData(updated);
   };
 
@@ -140,6 +142,50 @@ const FileGenerator: React.FC<{ token: string | null }> = () => {
     } finally {
       setLoading(false);
     }
+  };
+
+  const PAGE_BREAK_MARKER = '--- 換頁線 (Page Break) ---';
+
+  // 精確複製 python script 的分頁邏輯
+  const MARKERS = [
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', 
+    'c', 'b', 'v', 'p', 't', 'e', 
+    '§', '※', '©', '®', '＊', '*', 
+    'bridge', 'chorus', 'verse', 'pre-chorus', 'tag', 'ending',
+    '(1)', '(2)', '(3)', '(4)', '(c)', '(b)', '(v)', 
+    '（1）', '（2）', '（3）', '（c）', '（b）', 
+    '[1]', '[2]', '[c]', '[b]',
+    'verse', 'chorus', 'pc', 'p-c'
+  ];
+
+  const getLyricsWithPageBreaks = (lyrics: string[]): string => {
+    if (!lyrics || lyrics.length === 0) return '';
+  
+    const groups: string[][] = [];
+    let currentBuffer: string[] = [];
+    const maxLines = 2;
+  
+    lyrics.forEach(line => {
+      const cleanLine = line.trim();
+      if (!cleanLine) return; // 跳過空行
+  
+      const isMarkerLine = MARKERS.some(marker => cleanLine.toLowerCase().startsWith(marker));
+  
+      if (currentBuffer.length >= maxLines || (currentBuffer.length > 0 && isMarkerLine)) {
+        groups.push(currentBuffer);
+        currentBuffer = [];
+      }
+  
+      currentBuffer.push(line);
+    });
+  
+    if (currentBuffer.length > 0) {
+      groups.push(currentBuffer);
+    }
+    
+    return groups
+      .map(group => group.join('\n'))
+      .join(`\n${PAGE_BREAK_MARKER}\n`);
   };
 
   const safeSongs = Array.isArray(allSongs) ? allSongs : [];
@@ -387,7 +433,7 @@ const FileGenerator: React.FC<{ token: string | null }> = () => {
                     fullWidth
                     minRows={10} 
                     maxRows={15}
-                    value={data.lyrics.join('\n')}
+                    value={getLyricsWithPageBreaks(data.lyrics)}
                     onChange={(e) => handleLyricsChange(idx, e.target.value)}
                     variant="outlined"
                     sx={{ 

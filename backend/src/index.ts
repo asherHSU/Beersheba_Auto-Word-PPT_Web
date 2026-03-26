@@ -14,7 +14,12 @@ const app = express();
 const port = 3000;
 
 const PROJECT_ROOT = process.cwd();
-const PPT_LIBRARY_PATH = path.join(PROJECT_ROOT, "resources", "ppt_library");
+// Detect resources path (Local dev: ../resources, Docker/Prod: ./resources)
+const resourcesRoot = fs.existsSync(path.join(PROJECT_ROOT, "../resources")) 
+    ? path.join(PROJECT_ROOT, "../resources") 
+    : path.join(PROJECT_ROOT, "resources");
+
+const PPT_LIBRARY_PATH = path.join(resourcesRoot, "ppt_library");
 
 // 確保目錄存在
 if (!fs.existsSync(PPT_LIBRARY_PATH)) {
