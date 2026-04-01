@@ -35,6 +35,53 @@ let fileCache: { name: string; path: string; normalized: string }[] | null = nul
 let fileCacheRoot: string | null = null;
 let fileCacheBuiltAt = 0;
 
+/** 歌譜 PDF：檔名如 `401你是否曾求救主洗罪能.pdf`（編號緊接歌名，可位於 401-500 等子資料夾） */
+let scoreFileCache: { name: string; path: string }[] | null = null;
+let scoreFileCacheRoot: string | null = null;
+let scoreFileCacheBuiltAt = 0;
+
+/** 掃描完成後以編號 → 首選路徑，查詢 O(1)（多檔時排序規則與舊版線性搜尋一致） */
+let pptIdToPath: Map<number, string> | null = null;
+let scoreIdToPath: Map<number, string> | null = null;
+
+function rebuildPptIdMap(): void {
+    pptIdToPath = new Map();
+    if (!fileCache) return;
+    const byId = new Map<number, string[]>();
+    for (const file of fileCache) {
+        const fid = parseLeadingIdFromStem(file.name);
+        if (fid === null) continue;
+        const arr = byId.get(fid) ?? [];
+        arr.push(file.path);
+        byId.set(fid, arr);
+    }
+    for (const [id, paths] of byId) {
+        paths.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        pptIdToPath!.set(id, paths[0]);
+    }
+}
+
+function rebuildScoreIdMap(): void {
+    scoreIdToPath = new Map();
+    if (!scoreFileCache) return;
+    const byId = new Map<number, string[]>();
+    for (const file of scoreFileCache) {
+        const fid = parseScoreFileId(file.name);
+        if (fid === null) continue;
+        const arr = byId.get(fid) ?? [];
+        arr.push(file.path);
+        byId.set(fid, arr);
+    }
+    for (const [id, paths] of byId) {
+        paths.sort((a, b) => {
+            const d = scorePathSortKey(a) - scorePathSortKey(b);
+            if (d !== 0) return d;
+            return a.localeCompare(b, undefined, { sensitivity: 'base' });
+        });
+        scoreIdToPath!.set(id, paths[0]);
+    }
+}
+
 /** 毫秒。-1 = 不自動過期（與舊版相同，僅 upload / clearFileCache 會刷新）。預設 5 分鐘。 */
 function getPptLibraryCacheTtlMs(): number {
     const raw = process.env.PPT_LIBRARY_CACHE_TTL_MS;
@@ -51,10 +98,46 @@ function shouldRebuildFileCache(rootPath: string): boolean {
     return Date.now() - fileCacheBuiltAt > ttl;
 }
 
+function shouldRebuildScoreCache(rootPath: string): boolean {
+    if (!scoreFileCache || scoreFileCacheRoot !== rootPath) return true;
+    const ttl = getPptLibraryCacheTtlMs();
+    if (ttl < 0) return false;
+    return Date.now() - scoreFileCacheBuiltAt > ttl;
+}
+
 // 輔助：正規化字串 (去除非英數中文並轉小寫)
 function normalizeString(str: string): string {
     if (!str) return ""; // 防止 undefined 導致 crash
     return str.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '').toLowerCase();
+}
+
+/** PPT 檔名慣例：`1280-歌名.pptx` → 只取連字號前的編號與清單 id 對應（含全形 －、–、—） */
+function parseLeadingIdFromStem(stem: string): number | null {
+    const m = stem.match(/^(\d+)\s*[\-－–—]\s*(.*)$/u);
+    if (!m) return null;
+    const id = parseInt(m[1], 10);
+    return Number.isNaN(id) ? null : id;
+}
+
+/** 全形數字 ０-９ → ASCII，避免 ^(\d+) 對不到 Synology／部分匯出檔名 */
+function normalizeFullwidthDigits(s: string): string {
+    return s.replace(/[\uFF10-\uFF19]/g, (ch) =>
+        String.fromCharCode(ch.charCodeAt(0) - 0xff10 + 0x30)
+    );
+}
+
+/** 歌譜 PDF：`401你是否曾求救主洗罪能` → 開頭連續數字為編號（與歌名無分隔） */
+function parseScoreIdFromStem(stem: string): number | null {
+    const m = stem.replace(/^\uFEFF/, '').match(/^(\d+)/u);
+    if (!m) return null;
+    const id = parseInt(m[1], 10);
+    return Number.isNaN(id) ? null : id;
+}
+
+/** 歌譜檔名可為 `401-歌名`（與 PPT 同）或 `401歌名`（緊接） */
+function parseScoreFileId(stem: string): number | null {
+    const s = normalizeFullwidthDigits(stem.replace(/^\uFEFF/, '').normalize('NFC'));
+    return parseLeadingIdFromStem(s) ?? parseScoreIdFromStem(s);
 }
 
 // 遞迴建立檔案快取
@@ -96,13 +179,79 @@ function buildFileCache(rootPath: string) {
     fileCache = files;
     fileCacheRoot = rootPath;
     fileCacheBuiltAt = Date.now();
+    rebuildPptIdMap();
     generatorLogger.info(`✅ Cache built. Found ${files.length} presentation files in ${rootPath}`);
+}
+
+/** 歌譜：PDF 與常見掃圖（檔名規則同：開頭編號 + 歌名） */
+const SCORE_FILE_EXTENSIONS = new Set(['.pdf', '.jpg', '.jpeg', '.png']);
+
+function isScoreExtension(ext: string): boolean {
+    return SCORE_FILE_EXTENSIONS.has(ext.toLowerCase());
+}
+
+/** 同編號多檔時優先：PDF > JPEG > PNG */
+function scorePathSortKey(filePath: string): number {
+    const e = path.extname(filePath).toLowerCase();
+    if (e === '.pdf') return 0;
+    if (e === '.jpg' || e === '.jpeg') return 1;
+    if (e === '.png') return 2;
+    return 3;
+}
+
+function buildScoreFileCache(rootPath: string) {
+    if (!fs.existsSync(rootPath)) {
+        generatorLogger.warn(`⚠️ Score path does not exist: ${rootPath}`);
+        return;
+    }
+
+    const files: { name: string; path: string }[] = [];
+
+    function traverse(currentPath: string) {
+        if (!fs.existsSync(currentPath)) return;
+        try {
+            const items = fs.readdirSync(currentPath);
+            for (const item of items) {
+                const fullPath = path.join(currentPath, item);
+                const stat = fs.statSync(fullPath);
+                if (stat.isDirectory()) {
+                    traverse(fullPath);
+                } else if (stat.isFile()) {
+                    const ext = path.extname(item).toLowerCase();
+                    if (isScoreExtension(ext)) {
+                        const fileName = path.basename(item, ext);
+                        files.push({ name: fileName, path: fullPath });
+                    }
+                }
+            }
+        } catch {
+            // ignore
+        }
+    }
+
+    traverse(rootPath);
+    scoreFileCache = files;
+    scoreFileCacheRoot = rootPath;
+    scoreFileCacheBuiltAt = Date.now();
+    rebuildScoreIdMap();
+    if (files.length === 0) {
+        generatorLogger.warn(
+            `⚠️ 歌譜根目錄下未掃到任何 PDF/JPG/PNG（請確認路徑或子資料夾 401-500 等是否可讀）: ${rootPath}`
+        );
+    } else {
+        generatorLogger.info(`✅ Score cache built. Found ${files.length} score files in ${rootPath}`);
+    }
 }
 
 export function clearFileCache() {
     fileCache = null;
     fileCacheRoot = null;
     fileCacheBuiltAt = 0;
+    pptIdToPath = null;
+    scoreFileCache = null;
+    scoreFileCacheRoot = null;
+    scoreFileCacheBuiltAt = 0;
+    scoreIdToPath = null;
     generatorLogger.info('🔄 File cache cleared.');
 }
 
@@ -110,30 +259,37 @@ export function clearFileCache() {
 export async function findPptPath(rootPath: string, song: SongInput): Promise<string | null> {
     if (shouldRebuildFileCache(rootPath)) {
         fileCache = null;
+        pptIdToPath = null;
     }
     if (!fileCache) {
         buildFileCache(rootPath);
     }
 
-    if (!fileCache) return null;
+    if (!fileCache || !pptIdToPath) return null;
 
-    if (!song || !song.name) return null;
+    const sid = Number(song?.id);
+    if (!song || !Number.isFinite(sid)) return null;
 
-    const targetName = normalizeString(song.name);
-    // 比對 ID (例如 "001" 或 "1")
-    const idRegex = new RegExp(`^0*${song.id}([^0-9]|$)`);
+    return pptIdToPath.get(sid) ?? null;
+}
 
-    for (const file of fileCache) {
-        // 優先比對 ID
-        if (idRegex.test(file.name)) {
-            return file.path;
-        }
-        // 其次比對歌名 (模糊比對)
-        if (file.normalized.includes(targetName)) {
-            return file.path;
-        }
+/** 遞迴掃描歌譜根目錄（PDF / JPG / PNG；含 401-500 等子資料夾） */
+export async function findScorePath(rootPath: string, song: SongInput): Promise<string | null> {
+    if (!rootPath) return null;
+    if (shouldRebuildScoreCache(rootPath)) {
+        scoreFileCache = null;
+        scoreIdToPath = null;
     }
-    return null;
+    if (!scoreFileCache) {
+        buildScoreFileCache(rootPath);
+    }
+
+    if (!scoreFileCache || !scoreIdToPath) return null;
+
+    const sid = parseInt(String(song?.id).trim(), 10);
+    if (!song || Number.isNaN(sid)) return null;
+
+    return scoreIdToPath.get(sid) ?? null;
 }
 
 

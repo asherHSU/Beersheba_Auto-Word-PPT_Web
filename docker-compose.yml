@@ -1,4 +1,5 @@
-version: '3.8'
+# 專案根目錄 .env 可設 SONGS_CLOUD_ROOT（見 .env.example）
+# 勿再同時用「整包 ./resources」+ 子目錄掛載，在 Windows Docker 上易互相蓋掉導致歌譜／PPT 讀不到。
 
 services:
   # 1. 資料庫服務
@@ -13,46 +14,46 @@ services:
 
   # 2. 後端 API 服務
   backend:
-    # ✅ 改用 build，強制使用本機 Dockerfile 建置最新程式碼
     build: ./backend
-    # ❌ 移除 image，避免拉取到舊版
-    # image: asher31892774/church-backend:latest
     container_name: church_backend
     restart: always
     depends_on:
       - mongo
+    # 本機 npm run dev（5173）時 Vite 會代理到 localhost:3000；不映射則主機連不到容器內後端
+    ports:
+      - "127.0.0.1:3000:3000"
+    # 不掛整份 .env 進容器，避免 Z:\ 路徑覆蓋下方固定路徑；主機 .env 仍供 ${變數} 替換
     environment:
+      - DOCKER=1
       - MONGO_URI=mongodb://mongo:27017
-      # 可在專案根目錄 .env 設定 JWT_SECRET、PPT_LIBRARY_CACHE_TTL_MS
       - JWT_SECRET=${JWT_SECRET:-change_this_to_a_secure_secret_key}
       - PPT_LIBRARY_CACHE_TTL_MS=${PPT_LIBRARY_CACHE_TTL_MS:-300000}
+      # 覆寫 .env 裡的 Z:\ 路徑：與本機雲端資料夾結構一致（SONGS_CLOUD_ROOT 掛到 /app/cloud）
+      - PPT_LIBRARY_PATH=/app/cloud/2025 別是巴聖教會雲端詩歌PPT
+      - SCORE_LIBRARY_PATH=/app/cloud/2025 別是巴聖教會雲端詩歌譜
+      # 檔名須與雲端資料夾內實際 xlsx 一致（多數為「清單.xlsx」無空格；若你的檔名有空格請改此列）
+      - SONGS_FILE_PATH=/app/cloud/2025別是巴修正詩歌清單.xlsx
+      - SONGS_DATA_SOURCE=xlsx
     volumes:
-      # ✅ 掛載資源資料夾，確保生成的檔案能同步回本機
-      - ./resources:/app/resources
-      # 可選：覆寫 ppt_library。在 NAS 設 PPT_LIBRARY_HOST_PATH 指向雲端同步資料夾（見 .env.example）
-      - ${PPT_LIBRARY_HOST_PATH:-./resources/ppt_library}:/app/resources/ppt_library
+      # 單一根目錄：與 Z:\Google Cloud\2025 別是巴教會詩歌 同層（內含 PPT 資料夾、歌譜資料夾、歌單 xlsx）
+      - ${SONGS_CLOUD_ROOT:-./resources/cloud_mount_stub}:/app/cloud
       - ./output:/app/output
     networks:
       - church-net
 
   # 3. 前端網頁服務
   frontend:
-    # ✅ 改用 build，確保前端也是最新版
     build: ./frontend
-    # ❌ 移除 image
-    # image: asher31892774/church-frontend:latest
     container_name: church_frontend
     restart: always
     ports:
-      - "8080:80" 
+      - "8080:80"
     depends_on:
       - backend
     networks:
       - church-net
 
-  # 4.（選用）Cloudflare Tunnel：無固定 IP 時對外開站。需先在 Cloudflare 建立 Tunnel 並取得 TOKEN。
-  # 啟動：docker compose --profile tunnel up -d
-  # Zero Trust 裡「Public Hostname」的服務網址請設為 http://localhost:80（與 frontend 共用網路命名空間）
+  # 4.（選用）Cloudflare Tunnel
   cloudflared:
     profiles: ["tunnel"]
     image: cloudflare/cloudflared:latest

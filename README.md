@@ -2,18 +2,18 @@
 
 本專案旨在開發一套自動化系統，用於生成教會敬拜所需之多媒體資源。系統依據使用者選定的詩歌列表，能夠自動產出適用於大字報列印的 Word 文件，以及適用於投影播放的 PowerPoint 簡報。
 
-本系統已演進為一個完整的全端網頁應用程式 (Full-stack Web Application)。後端採用 Node.js 與 TypeScript 建構，並結合 Express.js 框架與 MongoDB 資料庫；前端則基於 React 與 TypeScript 開發，利用 Vite 進行建置。整體架構透過 Docker Compose 實現容器化部署，以確保環境的一致性與可移植性。
+本系統已演進為一個完整的全端網頁應用程式 (Full-stack Web Application)。後端採用 Node.js 與 TypeScript 建構，並結合 Express.js 框架；**MongoDB 僅用於儲存登入帳號**，詩歌清單與 PPT 來自本機檔案／雲端同步資料夾。前端則基於 React 與 TypeScript 開發，利用 Vite 進行建置。整體架構透過 Docker Compose 實現容器化部署，以確保環境的一致性與可移植性。
 
 ## 🚀 系統功能 (System Features)
 
-- **詩歌資料庫管理 (Song Database Management)**
-建立結構化的資料庫以儲存詩歌資訊，包含唯一識別碼 (ID) 與名稱，便於資料的持久化與檢索。
+- **詩歌清單 (Song list)**
+詩歌 ID 與名稱由本機 **json 或 xlsx** 提供（例如 Google 試算表同步後的檔案），不存放在 MongoDB。
 
 - **高效率詩歌檢索 (High-Performance Search)**
 支援透過 ID 或關鍵字進行模糊搜尋，快速定位所需詩歌資源。
 
-- **權限導向之資料管理 (Role-Based CRUD Operations)**
-提供完整的詩歌新增、編輯與刪除功能。系統實作了基於角色的存取控制 (RBAC)，確保僅有授權之管理員能執行資料異動操作。
+- **權限導向之資料管理 (Role-Based Access)**
+管理員帳號之新增、編輯與刪除儲存於 MongoDB；詩歌名單請於試算表或檔案維護，網站內 API 不提供寫入名單。
 
 - **自動化文件生成 (Automated Artifact Generation)**
 核心演算法能解析選定的詩歌內容，自動排版並生成 Microsoft Word (.docx) 與 PowerPoint (.pptx) 格式檔案，大幅降低人工製作成本。
@@ -69,9 +69,9 @@ graph TD
 Auto_Word_PPT/
 ├── backend/                 # 後端服務 (Node.js + Express + Python)
 │   ├── src/                 # TypeScript 原始碼
-│   │   ├── index.ts         # 伺服器入口 (API 路由、MongoDB 連線、權限驗證)
+│   │   ├── index.ts         # 伺服器入口 (API 路由、MongoDB 僅存帳號、權限驗證)
 │   │   ├── generator.ts     # 檔案生成邏輯控制器 (呼叫 Python 腳本)
-│   │   └── import-db.ts     # 資料庫初始化工具 (匯入 songs_db.json)
+│   │   └── song-list.ts     # 詩歌清單自本機檔案 (json/xlsx) 讀取
 │   ├── scripts/             # 外部腳本
 │   │   └── generator.py     # 核心生成引擎 (使用 python-docx/pptx 處理檔案)
 │   ├── dist/                # [Artifact] 編譯後的 JavaScript 執行檔
@@ -94,8 +94,8 @@ Auto_Word_PPT/
 │   ├── package.json         # 前端相依套件設定
 │   └── vite.config.ts       # Vite 建置設定
 ├── resources/               # 靜態資源與設定檔 (掛載至容器)
-│   ├── ppt_library/         # 存放 PPTX 來源檔案
-│   ├── songs_db.json        # 初始詩歌資料庫匯入檔
+│   ├── ppt_library/         # 存放 PPTX 來源檔案（或由 PPT_LIBRARY_PATH 指定同步資料夾）
+│   ├── songs_db.json        # 預設詩歌清單（json；若未設定 SONGS_FILE_PATH 且檔案存在則讀取）
 │   └── template.docx        # Word 大字報範本 (若有)
 ├── output/                  # [Artifact] 生成檔案輸出目錄
 ├── docker-compose.yml       # 容器編排設定檔
@@ -126,22 +126,19 @@ cp .env.example .env
 
 **參數說明：**
 
-- `MONGO_URI`: MongoDB 連線字串 (Docker 環境內預設為 mongodb://mongo:27017)。
+- `MONGO_URI`: MongoDB 連線字串 (Docker 環境內預設為 mongodb://mongo:27017)。**僅用於儲存登入帳號**，不儲存詩歌列表或 PPT。
 
 - `JWT_SECRET`: JWT 簽署密鑰 (警告：在生產環境中務必使用高強度的隨機字串)。
 
 - `VITE_API_URL`: 前端呼叫後端 API 的位址 (預設為 http://localhost:3000)。
 
-### 3. 資料庫初始化 (Database Initialization)
+- `SONGS_FILE_PATH` / `SONGS_DATA_SOURCE`: 詩歌清單來自本機 **json 或 xlsx**（例如 Google 試算表同步後的檔案）。未設定時若存在 `resources/songs_db.json` 則讀取該檔。
 
-系統包含初始化腳本，可將 `resources/songs_db.json` 匯入資料庫。
-若使用 Docker Compose，請參閱後續章節；若手動執行，請使用以下指令：
-```
-cd backend
-npm install
-npm run db:import
-cd ..
-```
+- `PPT_LIBRARY_PATH`: PPT 檔案根目錄（雲端同步之「雲端詩歌PPT」資料夾）。
+
+### 3. 詩歌名單與資料庫 (Song list & database)
+
+詩歌列表**不寫入 MongoDB**，改由上述檔案路徑讀取。MongoDB 僅在首次啟動時建立預設管理員帳號（若尚未有使用者）。
 
 ### 4. 容器化部署與維運 (Containerized Operations)
 
@@ -209,7 +206,7 @@ npm run dev
 僅超級管理員可存取「帳號管理」頁面，進行新增、修改或刪除其他管理員帳號的操作。
 
 3. 詩歌資料維護：
-透過「詩歌資料庫」頁面進行 CRUD 操作。
+詩歌名單以 **Google 試算表（同步為 xlsx）或 `resources/songs_db.json`** 為準；網頁「詩歌資料庫」頁面之新增／編輯／刪除已停用，請改編輯來源檔後再同步。
 
 4. 資源生成：
 於「製作敬拜檔案」頁面選取詩歌，系統將自動打包生成 ZIP 檔案供下載。

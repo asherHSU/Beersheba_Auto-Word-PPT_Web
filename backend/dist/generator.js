@@ -36,267 +36,397 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.clearFileCache = clearFileCache;
 exports.findPptPath = findPptPath;
+exports.findScorePath = findScorePath;
 exports.extractSongData = extractSongData;
-exports.generateWordDocument = generateWordDocument;
-exports.generateProjectionPpt = generateProjectionPpt;
 exports.generateFiles = generateFiles;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
-const docx_1 = require("docx");
-const pptxgenjs_1 = __importDefault(require("pptxgenjs"));
+const child_process_1 = require("child_process");
 const archiver_1 = __importDefault(require("archiver"));
-const textract_1 = __importDefault(require("textract"));
-// --- Core Functions ---
-async function findPptPath(rootPath, songTitle) {
-    const files = fs.readdirSync(rootPath);
-    for (const file of files) {
-        const filePath = path.join(rootPath, file);
-        const stat = fs.statSync(filePath);
-        if (stat.isDirectory()) {
-            const result = await findPptPath(filePath, songTitle);
-            if (result) {
-                return result;
-            }
-        }
-        else if (stat.isFile()) {
-            const fileName = path.basename(filePath, path.extname(filePath));
-            // From the python code:
-            // # 從檔名中分離出真正的歌曲標題 (支援 '-' 或 ' ' 分隔)
-            // title_from_file = ""
-            // if '-' in name_stem:
-            //     title_from_file = name_stem.split('-', 1)[-1].strip()
-            // elif ' ' in name_stem:
-            //     title_from_file = name_stem.split(' ', 1)[-1].strip()
-            // else:
-            //     title_from_file = name_stem.strip()
-            const titleFromFile = fileName.includes('-')
-                ? fileName.split('-').slice(1).join('-').trim()
-                : fileName.includes(' ')
-                    ? fileName.split(' ').slice(1).join(' ').trim()
-                    : fileName.trim();
-            if (titleFromFile.toLowerCase() === songTitle.toLowerCase()) {
-                return filePath;
-            }
-        }
+const winston_1 = __importDefault(require("winston"));
+const generatorLogger = winston_1.default.createLogger({
+    level: 'info',
+    format: winston_1.default.format.combine(winston_1.default.format.timestamp(), winston_1.default.format.printf(({ timestamp, level, message }) => {
+        return `[${timestamp}] ${level.toUpperCase()}: ${message}`;
+    })),
+    transports: [
+        new winston_1.default.transports.Console(),
+        new winston_1.default.transports.File({ filename: 'generator.log' }),
+    ],
+});
+// 🚀 第一部分：Node.js 快速檔案掃描 (解決缺檔顯示問題)
+// 外部同步（雲端→NAS）新增檔案後，需讓快取過期才會更新「有無 PPT」狀態；上傳 API 仍會手動 clear。
+let fileCache = null;
+let fileCacheRoot = null;
+let fileCacheBuiltAt = 0;
+/** 歌譜 PDF：檔名如 `401你是否曾求救主洗罪能.pdf`（編號緊接歌名，可位於 401-500 等子資料夾） */
+let scoreFileCache = null;
+let scoreFileCacheRoot = null;
+let scoreFileCacheBuiltAt = 0;
+/** 掃描完成後以編號 → 首選路徑，查詢 O(1)（多檔時排序規則與舊版線性搜尋一致） */
+let pptIdToPath = null;
+let scoreIdToPath = null;
+function rebuildPptIdMap() {
+    pptIdToPath = new Map();
+    if (!fileCache)
+        return;
+    const byId = new Map();
+    for (const file of fileCache) {
+        const fid = parseLeadingIdFromStem(file.name);
+        if (fid === null)
+            continue;
+        const arr = byId.get(fid) ?? [];
+        arr.push(file.path);
+        byId.set(fid, arr);
     }
-    return null;
+    for (const [id, paths] of byId) {
+        paths.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        pptIdToPath.set(id, paths[0]);
+    }
 }
-function cleanText(text) {
-    // Removes incompatible XML control characters but keeps newline, carriage return, and tab
-    return text.replace(/[\x00-\x08\x0e-\x1f]/g, '');
+function rebuildScoreIdMap() {
+    scoreIdToPath = new Map();
+    if (!scoreFileCache)
+        return;
+    const byId = new Map();
+    for (const file of scoreFileCache) {
+        const fid = parseScoreFileId(file.name);
+        if (fid === null)
+            continue;
+        const arr = byId.get(fid) ?? [];
+        arr.push(file.path);
+        byId.set(fid, arr);
+    }
+    for (const [id, paths] of byId) {
+        paths.sort((a, b) => {
+            const d = scorePathSortKey(a) - scorePathSortKey(b);
+            if (d !== 0)
+                return d;
+            return a.localeCompare(b, undefined, { sensitivity: 'base' });
+        });
+        scoreIdToPath.set(id, paths[0]);
+    }
 }
-async function extractSongData(songOrder, pptLibraryPath) {
-    console.log("--- 階段一：提取歌詞資料 ---");
-    const songsData = [];
-    for (const songTitle of songOrder) {
-        console.log(`正在處理歌曲: ${songTitle}...`);
-        const pptPath = await findPptPath(pptLibraryPath, songTitle);
-        const songInfo = { title: songTitle, lyrics: [], isPptOldFormat: false, found: false };
-        if (!pptPath) {
-            console.log(`  > 警告: 在資料庫中找不到 '${songTitle}' 的檔案。`);
-            songsData.push(songInfo);
-            continue;
-        }
-        songInfo.found = true;
-        if (pptPath.toLowerCase().endsWith(".ppt")) {
-            console.log(`  > 警告: '${songTitle}' 是舊版 .ppt 格式，無法自動提取歌詞。`);
-            songInfo.isPptOldFormat = true;
-            songsData.push(songInfo);
-            continue;
-        }
-        console.log(`  > 找到了: ${path.basename(pptPath)}`);
+/** 毫秒。-1 = 不自動過期（與舊版相同，僅 upload / clearFileCache 會刷新）。預設 5 分鐘。 */
+function getPptLibraryCacheTtlMs() {
+    const raw = process.env.PPT_LIBRARY_CACHE_TTL_MS;
+    if (raw === undefined || raw === '')
+        return 300000;
+    const n = parseInt(raw, 10);
+    if (Number.isNaN(n))
+        return 300000;
+    return n;
+}
+function shouldRebuildFileCache(rootPath) {
+    if (!fileCache || fileCacheRoot !== rootPath)
+        return true;
+    const ttl = getPptLibraryCacheTtlMs();
+    if (ttl < 0)
+        return false;
+    return Date.now() - fileCacheBuiltAt > ttl;
+}
+function shouldRebuildScoreCache(rootPath) {
+    if (!scoreFileCache || scoreFileCacheRoot !== rootPath)
+        return true;
+    const ttl = getPptLibraryCacheTtlMs();
+    if (ttl < 0)
+        return false;
+    return Date.now() - scoreFileCacheBuiltAt > ttl;
+}
+// 輔助：正規化字串 (去除非英數中文並轉小寫)
+function normalizeString(str) {
+    if (!str)
+        return ""; // 防止 undefined 導致 crash
+    return str.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '').toLowerCase();
+}
+/** PPT 檔名慣例：`1280-歌名.pptx` → 只取連字號前的編號與清單 id 對應（含全形 －、–、—） */
+function parseLeadingIdFromStem(stem) {
+    const m = stem.match(/^(\d+)\s*[\-－–—]\s*(.*)$/u);
+    if (!m)
+        return null;
+    const id = parseInt(m[1], 10);
+    return Number.isNaN(id) ? null : id;
+}
+/** 全形數字 ０-９ → ASCII，避免 ^(\d+) 對不到 Synology／部分匯出檔名 */
+function normalizeFullwidthDigits(s) {
+    return s.replace(/[\uFF10-\uFF19]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xff10 + 0x30));
+}
+/** 歌譜 PDF：`401你是否曾求救主洗罪能` → 開頭連續數字為編號（與歌名無分隔） */
+function parseScoreIdFromStem(stem) {
+    const m = stem.replace(/^\uFEFF/, '').match(/^(\d+)/u);
+    if (!m)
+        return null;
+    const id = parseInt(m[1], 10);
+    return Number.isNaN(id) ? null : id;
+}
+/** 歌譜檔名可為 `401-歌名`（與 PPT 同）或 `401歌名`（緊接） */
+function parseScoreFileId(stem) {
+    const s = normalizeFullwidthDigits(stem.replace(/^\uFEFF/, '').normalize('NFC'));
+    return parseLeadingIdFromStem(s) ?? parseScoreIdFromStem(s);
+}
+// 遞迴建立檔案快取
+function buildFileCache(rootPath) {
+    if (!fs.existsSync(rootPath)) {
+        generatorLogger.warn(`⚠️ Path does not exist: ${rootPath}`);
+        return;
+    }
+    const files = [];
+    function traverse(currentPath) {
+        if (!fs.existsSync(currentPath))
+            return;
         try {
-            const text = await new Promise((resolve, reject) => {
-                textract_1.default.fromFileWithPath(pptPath, (err, text) => {
-                    if (err) {
-                        return reject(err);
+            const items = fs.readdirSync(currentPath);
+            for (const item of items) {
+                const fullPath = path.join(currentPath, item);
+                const stat = fs.statSync(fullPath);
+                if (stat.isDirectory()) {
+                    traverse(fullPath);
+                }
+                else if (stat.isFile()) {
+                    const ext = path.extname(item).toLowerCase();
+                    if (ext === '.pptx' || ext === '.ppt') {
+                        const fileName = path.basename(item, ext);
+                        files.push({
+                            name: fileName,
+                            path: fullPath,
+                            normalized: normalizeString(fileName)
+                        });
                     }
-                    resolve(text);
-                });
-            });
-            const lines = text.split('\n').map(line => cleanText(line.trim())).filter(line => line);
-            songInfo.lyrics = lines;
-        }
-        catch (error) {
-            console.error(`  > 錯誤: 無法從 '${songTitle}' 提取文字:`, error);
-        }
-        songsData.push(songInfo);
-    }
-    console.log("--- 歌詞資料提取完成 ---");
-    return songsData;
-}
-async function generateWordDocument(songsData, templatePath, outputPath) {
-    console.log("--- 階段二：生成 Word 大字報 ---");
-    const sections = [];
-    for (const song of songsData) {
-        const children = [
-            new docx_1.Paragraph({
-                text: `【${song.title}】`,
-                style: "SongTitle",
-            }),
-        ];
-        if (!song.lyrics || song.lyrics.length === 0) {
-            let warningText = "";
-            if (!song.found) {
-                warningText = "【警告：在詩歌庫中找不到這首歌的檔案，請檢查歌名是否完全匹配】";
+                }
             }
-            else if (song.isPptOldFormat) {
-                warningText = "【注意：此歌曲為舊版.ppt格式，無法自動匯入，請手動處理】";
+        }
+        catch (e) {
+            // ignore permission errors etc.
+        }
+    }
+    traverse(rootPath);
+    fileCache = files;
+    fileCacheRoot = rootPath;
+    fileCacheBuiltAt = Date.now();
+    rebuildPptIdMap();
+    generatorLogger.info(`✅ Cache built. Found ${files.length} presentation files in ${rootPath}`);
+}
+/** 歌譜：PDF 與常見掃圖（檔名規則同：開頭編號 + 歌名） */
+const SCORE_FILE_EXTENSIONS = new Set(['.pdf', '.jpg', '.jpeg', '.png']);
+function isScoreExtension(ext) {
+    return SCORE_FILE_EXTENSIONS.has(ext.toLowerCase());
+}
+/** 同編號多檔時優先：PDF > JPEG > PNG */
+function scorePathSortKey(filePath) {
+    const e = path.extname(filePath).toLowerCase();
+    if (e === '.pdf')
+        return 0;
+    if (e === '.jpg' || e === '.jpeg')
+        return 1;
+    if (e === '.png')
+        return 2;
+    return 3;
+}
+function buildScoreFileCache(rootPath) {
+    if (!fs.existsSync(rootPath)) {
+        generatorLogger.warn(`⚠️ Score path does not exist: ${rootPath}`);
+        return;
+    }
+    const files = [];
+    function traverse(currentPath) {
+        if (!fs.existsSync(currentPath))
+            return;
+        try {
+            const items = fs.readdirSync(currentPath);
+            for (const item of items) {
+                const fullPath = path.join(currentPath, item);
+                const stat = fs.statSync(fullPath);
+                if (stat.isDirectory()) {
+                    traverse(fullPath);
+                }
+                else if (stat.isFile()) {
+                    const ext = path.extname(item).toLowerCase();
+                    if (isScoreExtension(ext)) {
+                        const fileName = path.basename(item, ext);
+                        files.push({ name: fileName, path: fullPath });
+                    }
+                }
+            }
+        }
+        catch {
+            // ignore
+        }
+    }
+    traverse(rootPath);
+    scoreFileCache = files;
+    scoreFileCacheRoot = rootPath;
+    scoreFileCacheBuiltAt = Date.now();
+    rebuildScoreIdMap();
+    if (files.length === 0) {
+        generatorLogger.warn(`⚠️ 歌譜根目錄下未掃到任何 PDF/JPG/PNG（請確認路徑或子資料夾 401-500 等是否可讀）: ${rootPath}`);
+    }
+    else {
+        generatorLogger.info(`✅ Score cache built. Found ${files.length} score files in ${rootPath}`);
+    }
+}
+function clearFileCache() {
+    fileCache = null;
+    fileCacheRoot = null;
+    fileCacheBuiltAt = 0;
+    pptIdToPath = null;
+    scoreFileCache = null;
+    scoreFileCacheRoot = null;
+    scoreFileCacheBuiltAt = 0;
+    scoreIdToPath = null;
+    generatorLogger.info('🔄 File cache cleared.');
+}
+// 尋找 PPT 路徑
+async function findPptPath(rootPath, song) {
+    if (shouldRebuildFileCache(rootPath)) {
+        fileCache = null;
+        pptIdToPath = null;
+    }
+    if (!fileCache) {
+        buildFileCache(rootPath);
+    }
+    if (!fileCache || !pptIdToPath)
+        return null;
+    const sid = Number(song?.id);
+    if (!song || !Number.isFinite(sid))
+        return null;
+    return pptIdToPath.get(sid) ?? null;
+}
+/** 遞迴掃描歌譜根目錄（PDF / JPG / PNG；含 401-500 等子資料夾） */
+async function findScorePath(rootPath, song) {
+    if (!rootPath)
+        return null;
+    if (shouldRebuildScoreCache(rootPath)) {
+        scoreFileCache = null;
+        scoreIdToPath = null;
+    }
+    if (!scoreFileCache) {
+        buildScoreFileCache(rootPath);
+    }
+    if (!scoreFileCache || !scoreIdToPath)
+        return null;
+    const sid = parseInt(String(song?.id).trim(), 10);
+    if (!song || Number.isNaN(sid))
+        return null;
+    return scoreIdToPath.get(sid) ?? null;
+}
+// 🐍 第二部分：Python 腳本呼叫
+async function runPythonScript(mode, payload, outputDir) {
+    // 🛠️ 修正：使用 process.cwd() 確保指向 /app (Docker) 或 專案根目錄 (Local)
+    const PROJECT_ROOT = process.cwd();
+    // Detect resources path (Local dev: ../resources, Docker/Prod: ./resources)
+    const RESOURCES_DIR = fs.existsSync(path.join(PROJECT_ROOT, "../resources"))
+        ? path.join(PROJECT_ROOT, "../resources")
+        : path.join(PROJECT_ROOT, "resources");
+    // 注意：腳本位置相對於 __dirname (dist/src) 
+    const SCRIPT_PATH = path.join(__dirname, '../scripts/generator.py');
+    return new Promise((resolve, reject) => {
+        // 參數順序: script.py [mode] [json_data] [resources_dir] [output_dir?]
+        const args = [SCRIPT_PATH, mode, JSON.stringify(payload), RESOURCES_DIR];
+        if (outputDir)
+            args.push(outputDir);
+        generatorLogger.info(`🐍 Running Python: ${mode}`);
+        generatorLogger.info(`📂 Resources Dir: ${RESOURCES_DIR}`);
+        // 使用 spawn 執行 python
+        const py = (0, child_process_1.spawn)('python', args);
+        let stdoutData = '';
+        let stderrData = '';
+        py.stdout.on('data', (data) => { stdoutData += data.toString(); });
+        py.stderr.on('data', (data) => { stderrData += data.toString(); });
+        py.on('close', (code) => {
+            if (code !== 0) {
+                generatorLogger.error(`Python error (${code}): ${stderrData}`);
+                return reject(new Error(`Python script failed: ${stderrData}`));
+            }
+            try {
+                // Python 可能會輸出多行 log，我們只需要最後一行的 JSON 結果
+                const lines = stdoutData.trim().split('\n');
+                let result = null;
+                // 從最後一行往回找 JSON
+                for (let i = lines.length - 1; i >= 0; i--) {
+                    try {
+                        const json = JSON.parse(lines[i]);
+                        if (json && (Array.isArray(json) || json.status || json.error)) {
+                            result = json;
+                            break;
+                        }
+                    }
+                    catch (e) {
+                        continue;
+                    }
+                }
+                if (!result)
+                    throw new Error('No JSON found in Python output');
+                if (result.error)
+                    return reject(new Error(result.error));
+                resolve(result);
+            }
+            catch (e) {
+                generatorLogger.error(`Invalid JSON from Python. Output: ${stdoutData}`);
+                reject(new Error('Invalid response from Python script'));
+            }
+        });
+    });
+}
+// 預覽功能
+async function extractSongData(songs, pptLibraryPath) {
+    const simplifiedSongs = songs.map(s => ({
+        id: s.id || 0,
+        name: s.name || s.title
+    }));
+    try {
+        const result = await runPythonScript('preview', simplifiedSongs);
+        return result;
+    }
+    catch (e) {
+        generatorLogger.error('Preview failed', e);
+        throw e;
+    }
+}
+// 生成檔案功能
+async function generateFiles(input) {
+    // 🛠️ 修正：使用 process.cwd() 確保路徑正確
+    const PROJECT_ROOT = process.cwd();
+    // Detect output path (Local dev: ../output, Docker/Prod: ./output)
+    const OUTPUT_DIR = fs.existsSync(path.join(PROJECT_ROOT, "../resources"))
+        ? path.join(PROJECT_ROOT, "../output")
+        : path.join(PROJECT_ROOT, "output");
+    if (!fs.existsSync(OUTPUT_DIR))
+        fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    const zipPath = path.join(OUTPUT_DIR, "presentation_files.zip");
+    const outputDocx = path.join(OUTPUT_DIR, "敬拜大字報.docx");
+    const outputPptx = path.join(OUTPUT_DIR, "敬拜PPT.pptx");
+    try {
+        // Python 腳本會接收 RESOURCES_DIR 並透過其內部的 find_ppt_path 遞迴搜尋
+        await runPythonScript('generate', input, OUTPUT_DIR);
+        // 開始打包 ZIP
+        const output = fs.createWriteStream(zipPath);
+        const archive = (0, archiver_1.default)('zip', { zlib: { level: 9 } });
+        return new Promise((resolve, reject) => {
+            output.on('close', () => {
+                generatorLogger.info(`Zip created: ${archive.pointer()} total bytes`);
+                resolve(zipPath);
+            });
+            archive.on('error', (err) => reject(err));
+            archive.pipe(output);
+            if (fs.existsSync(outputDocx)) {
+                archive.file(outputDocx, { name: '敬拜大字報.docx' });
             }
             else {
-                warningText = "【注意：找到了檔案，但未能成功提取任何歌詞】";
+                generatorLogger.warn('Word file not found after Python execution');
             }
-            children.push(new docx_1.Paragraph({
-                children: [
-                    new docx_1.TextRun({
-                        text: warningText,
-                        bold: true,
-                    }),
-                ],
-            }), new docx_1.Paragraph(""));
-        }
-        else {
-            for (const line of song.lyrics) {
-                children.push(new docx_1.Paragraph({
-                    text: line,
-                    style: "Lyrics",
-                }));
+            if (fs.existsSync(outputPptx)) {
+                archive.file(outputPptx, { name: '敬拜PPT.pptx' });
             }
-            children.push(new docx_1.Paragraph("")); // Add an empty paragraph for spacing
-        }
-        sections.push({ properties: { type: docx_1.SectionType.NEXT_PAGE }, children: children });
-    }
-    const doc = new docx_1.Document({
-        styles: {
-            paragraphStyles: [
-                {
-                    id: "SongTitle",
-                    name: "Song Title",
-                    basedOn: "Normal",
-                    next: "Normal",
-                    run: {
-                        font: "微軟正黑體",
-                        size: 28,
-                        bold: true,
-                    },
-                },
-                {
-                    id: "Lyrics",
-                    name: "Lyrics",
-                    basedOn: "Normal",
-                    next: "Normal",
-                    run: {
-                        font: "微軟正黑體",
-                        size: 24,
-                    },
-                },
-            ],
-        },
-        sections: sections,
-    });
-    const buffer = await docx_1.Packer.toBuffer(doc);
-    fs.writeFileSync(outputPath, buffer);
-    console.log(`--- Word 大字報已成功儲存至 '${outputPath}' ---`);
-}
-async function generateProjectionPpt(songsData, outputPath, linesPerSlide = 4) {
-    console.log("--- 階段三：生成投影用 PPT ---");
-    const pres = new pptxgenjs_1.default();
-    pres.layout = '16x9';
-    // Style settings
-    const blackFill = { color: '000000' };
-    const yellowText = { color: 'FFFF00' };
-    const fontName = '微軟正黑體';
-    const fontSize = 44;
-    const fontSizeTitle = 24;
-    for (const song of songsData) {
-        if (!song.lyrics || song.lyrics.length === 0) {
-            continue; // If there are no lyrics, skip the song
-        }
-        // --- Title Slide ---
-        const titleSlide = pres.addSlide();
-        titleSlide.background = { color: '000000' };
-        titleSlide.addText(song.title, {
-            x: 0,
-            y: 0,
-            w: '100%',
-            h: '100%',
-            align: 'center',
-            valign: 'middle',
-            fontFace: fontName,
-            fontSize: 60,
-            color: 'FFFFFF',
-            bold: true,
+            else {
+                generatorLogger.warn('PPT file not found after Python execution');
+            }
+            archive.finalize();
         });
-        // --- Lyrics Slides ---
-        for (let i = 0; i < song.lyrics.length; i += linesPerSlide) {
-            const slide = pres.addSlide();
-            slide.background = { color: '000000' };
-            const lyricsChunk = song.lyrics.slice(i, i + linesPerSlide);
-            const lyricsText = lyricsChunk.join('\n');
-            // Lyrics content
-            slide.addText(lyricsText, {
-                x: 0.5,
-                y: 0.25,
-                w: '95%',
-                h: '85%',
-                align: 'center',
-                valign: 'top',
-                fontFace: fontName,
-                fontSize: fontSize,
-                color: 'FFFF00',
-                bold: true,
-                lineSpacing: 50
-            });
-            // Footer with song title
-            slide.addText(song.title, {
-                x: 0,
-                y: '90%',
-                w: '100%',
-                h: '10%',
-                align: 'center',
-                valign: 'middle',
-                fontFace: fontName,
-                fontSize: fontSizeTitle,
-                color: 'FFFF00',
-            });
-        }
     }
-    await pres.writeFile({ fileName: outputPath });
-    console.log(`--- 投影用 PPT 已成功儲存至 '${outputPath}' ---`);
-}
-async function generateFiles(songOrder) {
-    const PROJECT_ROOT = path.join(__dirname, '..', '..');
-    const PPT_LIBRARY_PATH = path.join(PROJECT_ROOT, "resources", "ppt_library", "2025 別是巴聖教會雲端詩歌PPT修");
-    const TEMPLATE_DOCX_PATH = path.join(PROJECT_ROOT, "resources", "template.docx");
-    const OUTPUT_DIR = path.join(PROJECT_ROOT, 'output');
-    if (!fs.existsSync(OUTPUT_DIR)) {
-        fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    catch (e) {
+        generatorLogger.error('Generate failed', e);
+        throw e;
     }
-    const outputDocxPath = path.join(OUTPUT_DIR, "敬拜大字報.docx");
-    const outputPptxPath = path.join(OUTPUT_DIR, "敬拜PPT.pptx");
-    const zipPath = path.join(OUTPUT_DIR, "presentation_files.zip");
-    // --- Generate Files ---
-    const songsData = await extractSongData(songOrder, PPT_LIBRARY_PATH);
-    await generateWordDocument(songsData, TEMPLATE_DOCX_PATH, outputDocxPath);
-    await generateProjectionPpt(songsData, outputPptxPath, 2);
-    // --- Zip Files ---
-    const output = fs.createWriteStream(zipPath);
-    const archive = (0, archiver_1.default)('zip', {
-        zlib: { level: 9 } // Sets the compression level.
-    });
-    return new Promise((resolve, reject) => {
-        output.on('close', () => {
-            console.log(archive.pointer() + ' total bytes');
-            console.log('archiver has been finalized and the output file descriptor has closed.');
-            resolve(zipPath);
-        });
-        archive.on('error', (err) => {
-            reject(err);
-        });
-        archive.pipe(output);
-        archive.file(outputDocxPath, { name: '敬拜大字報.docx' });
-        archive.file(outputPptxPath, { name: '敬拜PPT.pptx' });
-        archive.finalize();
-    });
 }

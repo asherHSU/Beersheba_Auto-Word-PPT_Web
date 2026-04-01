@@ -44,20 +44,37 @@ def normalize_string(s):
     """正規化字串：去除非英數中文並轉小寫，用於比對檔名"""
     return re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', s).lower()
 
+def parse_leading_id_from_stem(name_stem):
+    """檔名慣例：1280-歌名.pptx → 只取連字號前的編號（含全形 －、en/em dash）"""
+    m = re.match(r'^(\d+)\s*[\-－–—]\s*(.*)$', name_stem)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
 def find_ppt_path(root_path, song_id, song_name):
-    """遞迴搜尋 PPT 檔案"""
+    """遞迴搜尋 PPT 檔案（與 Node findPptPath 一致：只對編號）"""
     if not os.path.exists(root_path): return None
-    target_name = normalize_string(song_name)
-    id_str = str(song_id)
-    id_regex = re.compile(rf"^0*{id_str}([^0-9]|$)")
+    try:
+        song_id = int(song_id)
+    except (TypeError, ValueError):
+        return None
+    id_paths = []
 
     for dirpath, _, filenames in os.walk(root_path):
         for filename in filenames:
             if not filename.lower().endswith(('.pptx', '.ppt')): continue
             name_stem = os.path.splitext(filename)[0]
-            if id_regex.match(name_stem): return os.path.join(dirpath, filename)
-            if target_name in normalize_string(name_stem): return os.path.join(dirpath, filename)
-    return None
+            fid = parse_leading_id_from_stem(name_stem)
+            if fid is not None and fid == song_id:
+                id_paths.append(os.path.join(dirpath, filename))
+
+    if not id_paths:
+        return None
+    id_paths.sort()
+    return id_paths[0]
 
 def extract_lyrics_from_ppt(ppt_path):
     """從 PPTX 提取歌詞"""

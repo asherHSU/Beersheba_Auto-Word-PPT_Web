@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Box, TextField, Button, Alert, CircularProgress } from '@mui/material';
 import LoginIcon from '@mui/icons-material/Login';
+import { apiUrl } from '../viteApiBase';
 
 interface LoginProps {
   // ✨ 修改介面：允許回傳 role
@@ -13,15 +14,13 @@ const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const API_URL = import.meta.env.VITE_API_URL || '';
-
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setMessage(null);
 
     try {
-      const response = await fetch(`${API_URL}/api/login`, {
+      const response = await fetch(apiUrl('/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password }),

@@ -1,11 +1,35 @@
-import express, { Request, Response, NextFunction } from 'express';
-import { MongoClient, ObjectId } from 'mongodb';
 import * as path from 'path';
 import * as fs from 'fs';
+import dotenv from 'dotenv';
+
+/** Docker 內 cwd=/app 時 ../.env 會變成 /.env，勿當成專案根目錄 */
+function isFilesystemRootDotenv(envPath: string): boolean {
+    const n = path.normalize(path.resolve(envPath));
+    return path.dirname(n) === path.parse(n).root;
+}
+
+const cwdEnv = path.resolve(process.cwd(), '.env');
+const parentEnv = path.resolve(process.cwd(), '..', '.env');
+
+if (fs.existsSync(parentEnv) && !isFilesystemRootDotenv(parentEnv)) {
+    dotenv.config({ path: parentEnv });
+} else if (fs.existsSync(cwdEnv)) {
+    dotenv.config({ path: cwdEnv });
+}
+
+const backendEnv = path.resolve(process.cwd(), '.env');
+if (fs.existsSync(backendEnv)) {
+    // Docker 內由 compose 注入 PPT_/SCORE_ 路徑時，勿被 backend/.env 覆蓋成 Windows 磁碟路徑
+    dotenv.config({ path: backendEnv, override: process.env.DOCKER !== '1' });
+}
+
+import express, { type Request, Response, NextFunction } from 'express';
+import { MongoClient, ObjectId } from 'mongodb';
 import multer from 'multer';
 import cors from 'cors'; 
 import morgan from 'morgan';
-import { generateFiles, extractSongData, findPptPath, clearFileCache } from './generator';
+import { generateFiles, extractSongData, findPptPath, findScorePath, clearFileCache } from './generator';
+import { loadSongRecordsFromFile, getSongListPage, resolveSongListFilePath, clearSongFileCache } from './song-list';
 import winston from 'winston';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -19,13 +43,113 @@ const resourcesRoot = fs.existsSync(path.join(PROJECT_ROOT, "../resources"))
     ? path.join(PROJECT_ROOT, "../resources") 
     : path.join(PROJECT_ROOT, "resources");
 
-const PPT_LIBRARY_PATH = path.join(resourcesRoot, "ppt_library");
+const PPT_LIBRARY_PATH = process.env.PPT_LIBRARY_PATH
+    ? path.resolve(process.env.PPT_LIBRARY_PATH)
+    : path.join(resourcesRoot, "ppt_library");
 
-// 確保目錄存在
+// 確保目錄存在（Docker 掛載 /app/cloud 時勿在容器內自建子資料夾，否則會蓋住空目錄、雲端檔案永遠看不到）
 if (!fs.existsSync(PPT_LIBRARY_PATH)) {
-    console.log(`Creating directory: ${PPT_LIBRARY_PATH}`);
-    fs.mkdirSync(PPT_LIBRARY_PATH, { recursive: true });
+    const skipMkdir = process.env.DOCKER === '1' && PPT_LIBRARY_PATH.startsWith('/app/cloud');
+    if (skipMkdir) {
+        console.warn(
+            `⚠️ Docker: PPT 路徑不存在（請在專案根 .env 設定 SONGS_CLOUD_ROOT=你的雲端資料夾，與 Z 槽同層）: ${PPT_LIBRARY_PATH}`
+        );
+    } else {
+        console.log(`Creating directory: ${PPT_LIBRARY_PATH}`);
+        fs.mkdirSync(PPT_LIBRARY_PATH, { recursive: true });
+    }
 }
+
+/** 遞迴檢查是否至少有一個歌譜檔（PDF / JPG / PNG；略過空資料夾） */
+function directoryContainsAnyScoreFile(rootDir: string, depth = 0): boolean {
+    if (depth > 30) return false;
+    const scoreExt = (n: string) => {
+        const e = n.toLowerCase();
+        return e.endsWith('.pdf') || e.endsWith('.jpg') || e.endsWith('.jpeg') || e.endsWith('.png');
+    };
+    try {
+        const names = fs.readdirSync(rootDir);
+        for (const name of names) {
+            const full = path.join(rootDir, name);
+            const st = fs.statSync(full);
+            if (st.isFile() && scoreExt(name)) return true;
+            if (st.isDirectory() && directoryContainsAnyScoreFile(full, depth + 1)) return true;
+        }
+    } catch {
+        return false;
+    }
+    return false;
+}
+
+/** 歌譜 PDF 根目錄：優先 SCORE_LIBRARY_PATH，其次與投影片同層之「雲端詩歌譜」資料夾，再試詩歌清單同層 */
+function resolveScoreLibraryPath(): string | null {
+    const tryDir = (p: string): string | null => {
+        const resolved = path.resolve(p);
+        try {
+            if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+                return resolved;
+            }
+        } catch {
+            return null;
+        }
+        return null;
+    };
+
+    const seen = new Set<string>();
+    const ordered: string[] = [];
+
+    const push = (p: string) => {
+        const r = path.resolve(p.trim());
+        if (seen.has(r)) return;
+        seen.add(r);
+        ordered.push(r);
+    };
+
+    const env = process.env.SCORE_LIBRARY_PATH?.trim();
+    if (env) {
+        const fromEnv = tryDir(env);
+        if (fromEnv) {
+            // 明確指定時直接使用（歌譜常在 401-500 等子資料夾，根目錄不一定有檔案）
+            console.log(`📂 歌譜目錄: ${fromEnv} (SCORE_LIBRARY_PATH)`);
+            return fromEnv;
+        }
+        console.warn(
+            `⚠️ SCORE_LIBRARY_PATH 指向的目錄不存在: ${path.resolve(env)}（請確認 SONGS_CLOUD_ROOT 已掛到 /app/cloud 且含「2025 別是巴教會雲端詩歌譜」資料夾）`
+        );
+        push(env);
+    }
+
+    push(path.join(PPT_LIBRARY_PATH, '2025 別是巴教會雲端詩歌譜'));
+    push(path.join(PPT_LIBRARY_PATH, '2025 別是巴聖教會雲端詩歌譜'));
+
+    try {
+        const songFile = resolveSongListFilePath();
+        const parent = path.dirname(songFile);
+        push(path.join(parent, '2025 別是巴教會雲端詩歌譜'));
+        push(path.join(parent, '2025 別是巴聖教會雲端詩歌譜'));
+    } catch {
+        // ignore
+    }
+
+    for (const c of ordered) {
+        const found = tryDir(c);
+        if (!found) continue;
+        if (directoryContainsAnyScoreFile(found)) {
+            console.log(`📂 歌譜目錄: ${found}`);
+            return found;
+        }
+        console.warn(`⚠️ 路徑存在但底下沒有任何 PDF/JPG/PNG，改試下一候選: ${found}`);
+    }
+
+    if (env) {
+        console.warn(`⚠️ 無法解析有效歌譜目錄（曾試 SCORE_LIBRARY_PATH: ${path.resolve(env)}）`);
+    } else {
+        console.warn('⚠️ 找不到含 PDF/JPG/PNG 的歌譜根目錄（請設定 SCORE_LIBRARY_PATH 或確認與投影片同層有歌譜資料夾）');
+    }
+    return null;
+}
+
+const SCORE_LIBRARY_PATH = resolveScoreLibraryPath();
 
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -51,9 +175,10 @@ app.use(express.json({ limit: '50mb' }));
 
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017';
 const DB_NAME = 'song_presentation';
-const COLLECTION_NAME = 'songs';
 const USERS_COLLECTION_NAME = 'users';
-let dbClient: MongoClient;
+/** 設為 1 時不連 Mongo（登入與帳號 API 不可用）。詩歌清單改為檔案，與 Mongo 無關 */
+const SKIP_MONGO = process.env.SKIP_MONGO === '1' || process.env.SKIP_MONGO === 'true';
+let dbClient: MongoClient | undefined;
 
 // ✨ 自動初始化超級管理員 (若資料庫無使用者)
 async function initSuperAdmin() {
@@ -85,7 +210,11 @@ async function connectToMongo() {
     logger.error('Failed to connect to MongoDB', error);
   }
 }
-connectToMongo();
+if (SKIP_MONGO) {
+    logger.warn('SKIP_MONGO=1: MongoDB disabled; login / user APIs unavailable.');
+} else {
+    connectToMongo();
+}
 
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecret';
 
@@ -118,7 +247,7 @@ const requireSuperAdmin = (req: AuthRequest, res: Response, next: NextFunction) 
 
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-  if (!dbClient) return res.status(500).json({ message: 'Database not connected' });
+  if (SKIP_MONGO || !dbClient) return res.status(503).json({ message: 'Database not connected' });
   
   const db = dbClient.db(DB_NAME);
   const user = await db.collection(USERS_COLLECTION_NAME).findOne({ username });
@@ -143,6 +272,7 @@ app.post('/api/login', async (req, res) => {
 
 // 1. 獲取所有使用者列表
 app.get('/api/users', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!dbClient) return res.status(503).json({ message: 'Database not connected' });
     const db = dbClient.db(DB_NAME);
     const users = await db.collection(USERS_COLLECTION_NAME)
         .find({}, { projection: { password: 0 } }) // 不回傳密碼hash
@@ -152,6 +282,7 @@ app.get('/api/users', authenticateToken, requireSuperAdmin, async (req, res) => 
 
 // 2. 新增使用者 (由 Super Admin 操作)
 app.post('/api/users', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!dbClient) return res.status(503).json({ message: 'Database not connected' });
     const { username, password, role } = req.body;
     const db = dbClient.db(DB_NAME);
     
@@ -171,6 +302,7 @@ app.post('/api/users', authenticateToken, requireSuperAdmin, async (req, res) =>
 
 // 3. 修改使用者 (密碼或權限)
 app.put('/api/users/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!dbClient) return res.status(503).json({ message: 'Database not connected' });
     const { id } = req.params;
     const { password, role } = req.body;
     const db = dbClient.db(DB_NAME);
@@ -192,6 +324,7 @@ app.put('/api/users/:id', authenticateToken, requireSuperAdmin, async (req, res)
 
 // 4. 刪除使用者
 app.delete('/api/users/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!dbClient) return res.status(503).json({ message: 'Database not connected' });
     const { id } = req.params;
     // 防止刪除自己
     // @ts-ignore
@@ -206,81 +339,112 @@ app.delete('/api/users/:id', authenticateToken, requireSuperAdmin, async (req, r
 
 // --- Song & File Routes ---
 
-// 1. Get Songs
+const MAX_SONGS_LIST_LIMIT = 50_000;
+
+function parseSkipFileStatus(req: Request): boolean {
+  const q = req.query as Record<string, unknown>;
+  const v = q.skipFileStatus ?? q.light;
+  if (v === undefined || v === null) return false;
+  const s = String(v).toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes';
+}
+
+// 1. Get Songs（僅從本機檔案讀取；Mongo 只存帳號，不存詩歌列表）
 app.get('/api/songs', async (req, res) => {
   try {
-    if (!dbClient) return res.status(500).json({ message: 'Database not connected' });
-    
-    const db = dbClient.db(DB_NAME);
     const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 20;
+    const rawLimit = parseInt(req.query.limit as string) || 20;
+    const limit = Math.min(Math.max(1, rawLimit), MAX_SONGS_LIST_LIMIT);
     const name = req.query.name as string;
+    const skipFileStatus = parseSkipFileStatus(req);
 
-    let query: any = {};
-    
-    if (name) {
-        query.name = { $regex: name, $options: 'i' };
-        
-        const total = await db.collection(COLLECTION_NAME).countDocuments(query);
-        const songs = await db.collection(COLLECTION_NAME)
-          .find(query)
-          .sort({ id: 1 })
-          .skip((page - 1) * limit)
-          .limit(limit)
-          .toArray();
+    const all = loadSongRecordsFromFile();
+    const { slice, total, totalPages } = getSongListPage(all, page, limit, name);
 
-        // 檢查檔案是否存在
-        const songsWithStatus = await Promise.all(songs.map(async (song) => {
-            // @ts-ignore
-            const filePath = await findPptPath(PPT_LIBRARY_PATH, song);
-            return { ...song, hasFile: !!filePath };
-        }));
-
-        return res.json({
-            data: songsWithStatus,
-            pagination: {
-                total,
-                page,
-                limit,
-                totalPages: Math.ceil(total / limit)
-            }
-        });
-
-    } else {
-        // 預設列出 ID 範圍，效能較佳
-        const startId = (page - 1) * limit + 1;
-        const endId = page * limit;
-        query.id = { $gte: startId, $lte: endId };
-
-        const songs = await db.collection(COLLECTION_NAME)
-          .find(query)
-          .sort({ id: 1 })
-          .toArray();
-
-        const totalDocs = await db.collection(COLLECTION_NAME).countDocuments({}); 
-        // 這裡假設 maxId 約等於 totalDocs，用於計算總頁數的近似值
-        const lastSong = await db.collection(COLLECTION_NAME).find().sort({ id: -1 }).limit(1).toArray();
-        const maxId = lastSong[0]?.id || totalDocs;
-
-        const songsWithStatus = await Promise.all(songs.map(async (song) => {
-            // @ts-ignore
-            const filePath = await findPptPath(PPT_LIBRARY_PATH, song);
-            return { ...song, hasFile: !!filePath };
-        }));
-
-        res.json({
-            data: songsWithStatus,
-            pagination: {
-                total: totalDocs,
-                page,
-                limit,
-                totalPages: Math.ceil(maxId / limit) 
-            }
-        });
+    if (skipFileStatus) {
+      const data = slice.map((song) => ({ id: song.id, name: song.name }));
+      return res.json({
+        data,
+        pagination: {
+          total,
+          page,
+          limit,
+          totalPages,
+        },
+      });
     }
+
+    const songsWithStatus = await Promise.all(
+        slice.map(async (song) => {
+            const filePath = await findPptPath(PPT_LIBRARY_PATH, song);
+            let hasScore = false;
+            if (SCORE_LIBRARY_PATH && fs.existsSync(SCORE_LIBRARY_PATH)) {
+                const scorePath = await findScorePath(SCORE_LIBRARY_PATH, song);
+                hasScore = !!scorePath;
+            }
+            return { ...song, hasFile: !!filePath, hasScore };
+        })
+    );
+    return res.json({
+        data: songsWithStatus,
+        pagination: {
+            total,
+            page,
+            limit,
+            totalPages,
+        },
+    });
   } catch (error) {
     logger.error(error);
-    res.status(500).json({ message: 'Error fetching songs' });
+    const msg = error instanceof Error ? error.message : 'Error fetching songs';
+    res.status(500).json({
+      message: msg.includes('Song list file not found')
+        ? `${msg}（Docker 請在專案根 .env 設定 SONGS_CLOUD_ROOT，並確認掛載內含歌單 xlsx）`
+        : msg,
+    });
+  }
+});
+
+// 下載單首詩歌檔案（投影片 ppt/pptx 或歌譜 pdf/jpg/png）
+app.get('/api/songs/:id/download', async (req, res) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (Number.isNaN(id)) {
+      return res.status(400).json({ message: 'Invalid song id' });
+    }
+    const typeRaw = String(req.query.type || 'ppt').toLowerCase();
+    const isScore = typeRaw === 'score' || typeRaw === '歌譜';
+
+    const all = loadSongRecordsFromFile();
+    const song = all.find((s) => s.id === id);
+    if (!song) {
+      return res.status(404).json({ message: 'Song not found' });
+    }
+
+    let filePath: string | null = null;
+    if (isScore) {
+      if (!SCORE_LIBRARY_PATH || !fs.existsSync(SCORE_LIBRARY_PATH)) {
+        return res.status(404).json({ message: 'Score library not available' });
+      }
+      filePath = await findScorePath(SCORE_LIBRARY_PATH, song);
+    } else {
+      filePath = await findPptPath(PPT_LIBRARY_PATH, song);
+    }
+
+    if (!filePath || !fs.existsSync(filePath)) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+
+    const basename = path.basename(filePath);
+    res.download(filePath, basename, (err) => {
+      if (err) {
+        logger.error(err);
+        if (!res.headersSent) res.status(500).end();
+      }
+    });
+  } catch (error) {
+    logger.error(error);
+    res.status(500).json({ message: 'Download failed' });
   }
 });
 
@@ -321,31 +485,62 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
     res.json({ message: 'File uploaded successfully', filename: req.file.originalname });
 });
 
-// CRUD Operations
+/** 手動清除 PPT／歌譜掃描快取，下次讀取列表會重新偵測檔案（與上傳後自動清除相同） */
+app.post('/api/library/refresh-cache', authenticateToken, (_req, res) => {
+    try {
+        clearFileCache();
+        logger.info('Library cache manually refreshed (PPT + score)');
+        res.json({ message: '已更新檔案掃描（投影片與歌譜），請重新整理列表。' });
+    } catch (e) {
+        logger.error(e);
+        res.status(500).json({ message: 'Failed to refresh cache' });
+    }
+});
+
+/** 重新讀取歌單檔（xlsx/json），與「更新檔案狀態」分開；試算表同步後若內容已變可手動觸發 */
+const songListFileRefreshHandler = (_req: Request, res: Response) => {
+    try {
+        clearSongFileCache();
+        logger.info('Song list file cache cleared (reload on next /api/songs)');
+        res.json({ message: '已重新載入歌單來源，請重新整理列表。' });
+    } catch (e) {
+        logger.error(e);
+        res.status(500).json({ message: 'Failed to refresh song list' });
+    }
+};
+app.post('/api/library/refresh-songs', authenticateToken, songListFileRefreshHandler);
+/** 與 refresh-songs 相同；若舊版代理只轉發 /api/songs 下路由可改用此路徑 */
+app.post('/api/songs/reload-source', authenticateToken, songListFileRefreshHandler);
+
+// 詩歌清單僅來自檔案／試算表同步，不提供 API 寫入（請改 Google 試算表或 JSON 檔）
 app.post('/api/songs', authenticateToken, async (req, res) => {
-    const db = dbClient.db(DB_NAME);
-    const { name } = req.body;
-    const lastSong = await db.collection(COLLECTION_NAME).find().sort({id: -1}).limit(1).toArray();
-    const newId = (lastSong[0]?.id || 0) + 1;
-    await db.collection(COLLECTION_NAME).insertOne({ id: newId, name });
-    res.json({ message: 'Song added', id: newId });
+    return res.status(503).json({
+        message: 'Song list is file-based only. Edit the spreadsheet or SONGS_FILE_PATH source, not the API.',
+    });
 });
 
 app.put('/api/songs/:id', authenticateToken, async (req, res) => {
-    const db = dbClient.db(DB_NAME);
-    const id = parseInt(req.params.id);
-    const { name } = req.body;
-    await db.collection(COLLECTION_NAME).updateOne({ id }, { $set: { name } });
-    res.json({ message: 'Song updated' });
+    return res.status(503).json({
+        message: 'Song list is file-based only. Edit the spreadsheet or SONGS_FILE_PATH source, not the API.',
+    });
 });
 
 app.delete('/api/songs/:id', authenticateToken, async (req, res) => {
-    const db = dbClient.db(DB_NAME);
-    const id = parseInt(req.params.id);
-    await db.collection(COLLECTION_NAME).deleteOne({ id });
-    res.json({ message: 'Song deleted' });
+    return res.status(503).json({
+        message: 'Song list is file-based only. Edit the spreadsheet or SONGS_FILE_PATH source, not the API.',
+    });
 });
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
+  console.log(`PPT library (hasFile 掃描路徑): ${PPT_LIBRARY_PATH}`);
+  if (SCORE_LIBRARY_PATH) {
+    console.log(`Score library (hasScore 掃描路徑): ${SCORE_LIBRARY_PATH}`);
+  } else if (process.env.SCORE_LIBRARY_PATH?.trim()) {
+    console.log(
+      `Score library: (歌譜根目錄解析失敗，環境變數為 ${process.env.SCORE_LIBRARY_PATH}，請檢查 SONGS_CLOUD_ROOT 掛載)`
+    );
+  } else {
+    console.log('Score library: (未設定 SCORE_LIBRARY_PATH，歌譜狀態一律為缺檔)');
+  }
 });

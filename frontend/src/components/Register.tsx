@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Box, TextField, Button, Typography, Alert, CircularProgress } from '@mui/material';
 import PersonAddIcon from '@mui/icons-material/PersonAdd';
+import { apiUrl } from '../viteApiBase';
 
 const Register: React.FC = () => {
   const [username, setUsername] = useState('');
@@ -8,15 +9,13 @@ const Register: React.FC = () => {
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const API_URL = import.meta.env.VITE_API_URL || '';
-
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setMessage(null);
 
     try {
-      const response = await fetch(`${API_URL}/api/register`, {
+      const response = await fetch(apiUrl('/register'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password }),

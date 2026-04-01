@@ -1,0 +1,7 @@
+# Python 產檔腳本 generator.py 依賴（正式環境請鎖定版本）
+# 安裝：python -m pip install -r requirements-generator.txt
+#
+# 建議 Python：3.10 或以上（與 docx / pptx 套件相容）
+
+python-docx>=0.8.11
+python-pptx>=0.6.21

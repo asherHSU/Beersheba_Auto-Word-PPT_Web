@@ -12,6 +12,7 @@ import PlaylistAddCheckIcon from '@mui/icons-material/PlaylistAddCheck';
 import DownloadIcon from '@mui/icons-material/Download';
 import DragIndicatorIcon from '@mui/icons-material/DragIndicator';
 import { DragDropContext, Droppable, Draggable, DropResult } from '@hello-pangea/dnd';
+import { apiUrl } from '../viteApiBase';
 
 interface SongData {
   title: string;
@@ -45,10 +46,8 @@ const FileGenerator: React.FC<{ token: string | null }> = () => {
     };
   }, []);
 
-  const API_URL = import.meta.env.VITE_API_URL || '';
-
   useEffect(() => {
-    fetch(`${API_URL}/api/songs?limit=2000`)
+    fetch(`${apiUrl('/songs')}?page=1&limit=50000&skipFileStatus=1`)
       .then(res => {
         if (!res.ok) {
             throw new Error(`HTTP error! status: ${res.status}`);
@@ -93,7 +92,7 @@ const FileGenerator: React.FC<{ token: string | null }> = () => {
     if (selectedSongs.length === 0) return;
     setLoading(true);
     try {
-      const response = await fetch(`${API_URL}/api/preview`, {
+      const response = await fetch(apiUrl('/preview'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ songs: selectedSongs }) 
@@ -119,7 +118,7 @@ const FileGenerator: React.FC<{ token: string | null }> = () => {
   const handleGenerate = async () => {
     setLoading(true);
     try {
-      const response = await fetch(`${API_URL}/api/generate`, {
+      const response = await fetch(apiUrl('/generate'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ songData: previewData })
@@ -189,9 +188,14 @@ const FileGenerator: React.FC<{ token: string | null }> = () => {
   };
 
   const safeSongs = Array.isArray(allSongs) ? allSongs : [];
-  const filteredSongs = safeSongs.filter(s => 
-    s.name && s.name.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const q = searchTerm.trim();
+  const qLower = q.toLowerCase();
+  const filteredSongs = safeSongs.filter((s) => {
+    if (!q) return true;
+    const nameMatch = s.name && s.name.toLowerCase().includes(qLower);
+    const idMatch = String(s.id).includes(q);
+    return nameMatch || idMatch;
+  });
 
   return (
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
@@ -253,7 +257,7 @@ const FileGenerator: React.FC<{ token: string | null }> = () => {
               
               <TextField
                 fullWidth
-                placeholder="輸入歌名搜尋..."
+                placeholder="輸入歌名或編號搜尋..."
                 value={searchTerm}
                 onChange={e => setSearchTerm(e.target.value)}
                 InputProps={{

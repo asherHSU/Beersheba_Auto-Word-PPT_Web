@@ -11,6 +11,7 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import SecurityIcon from '@mui/icons-material/Security';
 import PersonIcon from '@mui/icons-material/Person';
 import SupervisorAccountIcon from '@mui/icons-material/SupervisorAccount';
+import { apiUrl } from '../viteApiBase';
 
 interface User {
   _id: string;
@@ -29,11 +30,9 @@ const UserManager: React.FC<UserManagerProps> = ({ token }) => {
   const [currentUser, setCurrentUser] = useState<Partial<User> & { password?: string }>({});
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null);
 
-  const API_URL = import.meta.env.VITE_API_URL || '';
-
   const fetchUsers = async () => {
     try {
-      const res = await fetch(`${API_URL}/api/users`, {
+      const res = await fetch(apiUrl('/users'), {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       if (res.ok) {
@@ -76,8 +75,8 @@ const UserManager: React.FC<UserManagerProps> = ({ token }) => {
 
     try {
       const url = currentUser._id 
-        ? `${API_URL}/api/users/${currentUser._id}` 
-        : `${API_URL}/api/users`;
+        ? apiUrl(`/users/${currentUser._id}`) 
+        : apiUrl('/users');
       
       const method = currentUser._id ? 'PUT' : 'POST';
 
@@ -106,7 +105,7 @@ const UserManager: React.FC<UserManagerProps> = ({ token }) => {
   const handleDelete = async (id: string) => {
     if (!window.confirm('確定要刪除此帳號嗎？刪除後無法復原。')) return;
     try {
-      const res = await fetch(`${API_URL}/api/users/${id}`, {
+      const res = await fetch(apiUrl(`/users/${id}`), {
         method: 'DELETE',
         headers: { 'Authorization': `Bearer ${token}` }
       });
