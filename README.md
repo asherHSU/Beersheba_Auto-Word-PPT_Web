@@ -151,8 +151,8 @@ cp .env.example .env
 # 建置前端映像檔 (指定平台以確保相容性)
 docker buildx build --no-cache --platform linux/amd64 -t asher31892774/church-frontend:latest ./frontend
 
-# 建置後端映像檔
-docker buildx build --no-cache --platform linux/amd64 -t asher31892774/church-backend:latest ./backend
+# 建置後端映像檔（context 須為專案根，才能帶入 resources/template.docx）
+docker buildx build --no-cache --platform linux/amd64 -t asher31892774/church-backend:latest -f backend/Dockerfile .
 
 # 推送映像檔至 Registry
 docker push asher31892774/church-frontend:latest

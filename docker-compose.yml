@@ -14,7 +14,10 @@ services:
 
   # 2. 後端 API 服務
   backend:
-    build: ./backend
+    # context 用專案根，才能把 resources/template.docx 一併 COPY 進映像（見 backend/Dockerfile）
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: church_backend
     restart: always
     depends_on:

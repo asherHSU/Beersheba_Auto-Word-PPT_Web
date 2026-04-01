@@ -31,7 +31,9 @@ except IndexError:
     print(json.dumps({"error": "Missing arguments"}))
     sys.exit(1)
 
-PPT_LIBRARY_PATH = os.path.join(RESOURCES_DIR, "ppt_library")
+# 與 Node 後端一致：優先使用環境變數（Docker / .env 的 PPT_LIBRARY_PATH），否則用專案內 resources/ppt_library
+_ppt_env = (os.environ.get("PPT_LIBRARY_PATH") or "").strip()
+PPT_LIBRARY_PATH = _ppt_env if _ppt_env and os.path.isdir(_ppt_env) else os.path.join(RESOURCES_DIR, "ppt_library")
 TEMPLATE_PATH = os.path.join(RESOURCES_DIR, "template.docx")
 
 # --- 輔助函式 ---

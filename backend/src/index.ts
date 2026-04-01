@@ -114,7 +114,7 @@ function resolveScoreLibraryPath(): string | null {
             return fromEnv;
         }
         console.warn(
-            `⚠️ SCORE_LIBRARY_PATH 指向的目錄不存在: ${path.resolve(env)}（請確認 SONGS_CLOUD_ROOT 已掛到 /app/cloud 且含「2025 別是巴教會雲端詩歌譜」資料夾）`
+            `⚠️ SCORE_LIBRARY_PATH 指向的目錄不存在: ${path.resolve(env)}（請確認掛載內含「2025 別是巴聖教會雲端詩歌譜」；舊版資料夾名可能為「2025 別是巴教會雲端詩歌譜」）`
         );
         push(env);
     }

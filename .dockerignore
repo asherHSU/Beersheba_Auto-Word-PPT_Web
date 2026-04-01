@@ -1,0 +1,14 @@
+# 縮小 backend 建置 context（compose 使用專案根為 context 時）
+.git
+.gitignore
+**/node_modules
+output
+frontend/dist
+frontend/node_modules
+backend/node_modules
+backend/dist
+backend/*.log
+*.log
+# 大型本機資料（勿打進 image）
+2025 別是巴教會詩歌
+resources/docker_cloud

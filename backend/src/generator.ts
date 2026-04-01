@@ -295,13 +295,17 @@ export async function findScorePath(rootPath: string, song: SongInput): Promise<
 
 // 🐍 第二部分：Python 腳本呼叫
 
-async function runPythonScript(mode: 'preview' | 'generate', payload: any, outputDir?: string): Promise<any> {
+async function runPythonScript(mode: 'preview' | 'generate', payload: any, outputDir?: string, pptLibraryRoot?: string): Promise<any> {
     // 🛠️ 修正：使用 process.cwd() 確保指向 /app (Docker) 或 專案根目錄 (Local)
     const PROJECT_ROOT = process.cwd(); 
     // Detect resources path (Local dev: ../resources, Docker/Prod: ./resources)
     const RESOURCES_DIR = fs.existsSync(path.join(PROJECT_ROOT, "../resources")) 
         ? path.join(PROJECT_ROOT, "../resources") 
         : path.join(PROJECT_ROOT, "resources");
+    // 與 index.ts 一致：Python 預覽／生成須搜尋同一個 PPT 根目錄（勿只用 resources/ppt_library）
+    const resolvedPptRoot =
+        pptLibraryRoot ||
+        (process.env.PPT_LIBRARY_PATH ? path.resolve(process.env.PPT_LIBRARY_PATH) : path.join(RESOURCES_DIR, 'ppt_library'));
     // 注意：腳本位置相對於 __dirname (dist/src) 
     const SCRIPT_PATH = path.join(__dirname, '../scripts/generator.py');
 
@@ -312,9 +316,11 @@ async function runPythonScript(mode: 'preview' | 'generate', payload: any, outpu
 
         generatorLogger.info(`🐍 Running Python: ${mode}`);
         generatorLogger.info(`📂 Resources Dir: ${RESOURCES_DIR}`);
+        generatorLogger.info(`📂 PPT library (for Python): ${resolvedPptRoot}`);
         
-        // 使用 spawn 執行 python
-        const py = spawn('python', args);
+        const py = spawn('python', args, {
+            env: { ...process.env, PPT_LIBRARY_PATH: resolvedPptRoot },
+        });
 
         let stdoutData = '';
         let stderrData = '';
@@ -364,7 +370,7 @@ export async function extractSongData(songs: SongInput[] | any[], pptLibraryPath
     }));
     
     try {
-        const result = await runPythonScript('preview', simplifiedSongs);
+        const result = await runPythonScript('preview', simplifiedSongs, undefined, pptLibraryPath);
         return result as SongData[];
     } catch (e) {
         generatorLogger.error('Preview failed', e);
